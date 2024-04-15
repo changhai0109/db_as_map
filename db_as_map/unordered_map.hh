@@ -2,7 +2,6 @@
 #define DB_AS_MAP__UNORDERED_MAP
 
 #include <sqlite3.h>
-#include <memory>
 #include <stdexcept>
 #include <string>
 
@@ -12,7 +11,7 @@ template <class Key, class Value>
 class unordered_map {
  private:
   std::string db_name;
-  std::unique_ptr<sqlite3, decltype(&sqlite3_close)> db;
+  sqlite3* db;
   std::string table_name;
   static uint64_t _table_cnt;
   void create_table();
@@ -22,6 +21,7 @@ class unordered_map {
  public:
   unordered_map(const std::string& db_name);
   unordered_map();
+  ~unordered_map();
 
   void insert(const Key& key, const Value& value);
 

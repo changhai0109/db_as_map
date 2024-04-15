@@ -1,5 +1,5 @@
 #include <sqlite3.h>
-#include <iostream>
+#include <unistd.h>
 #include <string>
 #include <type_traits>
 #include "db_as_map/serialize.hh"
@@ -10,17 +10,16 @@ uint64_t db_as_map::unordered_map<Key, Value>::_table_cnt = 0ul;
 
 template <class Key, class Value>
 db_as_map::unordered_map<Key, Value>::unordered_map(const std::string& db_name)
-    : db_name(db_name), db(nullptr, sqlite3_close) {
+    : db_name(db_name), db(nullptr) {
   sqlite3* db_ptr;
   if (sqlite3_open(db_name.c_str(), &db_ptr) != SQLITE_OK) {
     throw std::runtime_error("Can't open database: " + db_name);
   }
-  db.reset(db_ptr);
+  db = db_ptr;
 
   while (sqlite3_table_column_metadata(
-             db.get(), nullptr, ("map" + std::to_string(_table_cnt)).c_str(),
-             nullptr, nullptr, nullptr, nullptr, nullptr,
-             nullptr) == SQLITE_OK) {
+             db, nullptr, ("map" + std::to_string(_table_cnt)).c_str(), nullptr,
+             nullptr, nullptr, nullptr, nullptr, nullptr) == SQLITE_OK) {
     ++_table_cnt;
   }
   table_name = "map" + std::to_string(_table_cnt++);
@@ -30,10 +29,12 @@ db_as_map::unordered_map<Key, Value>::unordered_map(const std::string& db_name)
 template <class Key, class Value>
 db_as_map::unordered_map<Key, Value>::unordered_map()
     : unordered_map([]() {
-        char buffer[L_tmpnam];
-        if (!tmpnam(buffer)) {
+        char buffer[] = "/tmp/db_as_map_XXXXXX.db";
+        int tempFileDescriptor = mkstemps64(buffer, 3);
+        if (tempFileDescriptor == -1) {
           throw std::runtime_error("Can't create temporary file");
         }
+        close(tempFileDescriptor);
         return std::string(buffer);
       }()) {}
 
@@ -43,7 +44,7 @@ void db_as_map::unordered_map<Key, Value>::create_table() {
 
 #define _SPECIAL_CASE_MACRO(_T, _S)                                            \
   if constexpr (std::is_same<Value, _T>::value) {                              \
-    if (sqlite3_exec(db.get(),                                                 \
+    if (sqlite3_exec(db,                                                       \
                      ("CREATE TABLE IF NOT EXISTS " + table_name +             \
                       " (key TEXT PRIMARY KEY, "                               \
                       "value " +                                               \
@@ -77,7 +78,7 @@ void db_as_map::unordered_map<Key, Value>::create_table() {
   _SPECIAL_CASE_MACRO(std::u16string, "TEXT");
   _SPECIAL_CASE_MACRO(std::u32string, "TEXT");
 #undef _SPECIAL_CASE_MACRO
-  if (sqlite3_exec(db.get(),
+  if (sqlite3_exec(db,
                    ("CREATE TABLE IF NOT EXISTS " + table_name +
                     " (key TEXT PRIMARY KEY, "
                     "value BLOB);")
@@ -124,7 +125,6 @@ void db_as_map::unordered_map<Key, Value>::sqlite3_bind_key(sqlite3_stmt* stmt,
     key_str = key;
   else
     key_str = std::to_string(key);
-  std::cout << key << " " << key_str << std::endl;
   sqlite3_bind_text(stmt, idx, key_str.c_str(), key_str.size(),
                     SQLITE_TRANSIENT);
 }
@@ -136,7 +136,7 @@ void db_as_map::unordered_map<Key, Value>::insert(const Key& key,
     throw std::runtime_error("Key already exists");
   }
   sqlite3_stmt* stmt;
-  if (sqlite3_prepare_v2(db.get(),
+  if (sqlite3_prepare_v2(db,
                          ("INSERT INTO " + table_name +
                           " (key, value) VALUES "
                           "(?, ?);")
@@ -159,8 +159,8 @@ bool db_as_map::unordered_map<Key, Value>::erase(const Key& key) {
   }
   sqlite3_stmt* stmt;
   if (sqlite3_prepare_v2(
-          db.get(), ("DELETE FROM " + table_name + " WHERE key = ?;").c_str(),
-          -1, &stmt, nullptr) != SQLITE_OK) {
+          db, ("DELETE FROM " + table_name + " WHERE key = ?;").c_str(), -1,
+          &stmt, nullptr) != SQLITE_OK) {
     throw std::runtime_error("Can't prepare statement");
   }
   this->sqlite3_bind_key(stmt, 1, key);
@@ -175,9 +175,8 @@ template <class Key, class Value>
 bool db_as_map::unordered_map<Key, Value>::in(const Key& key) {
   sqlite3_stmt* stmt;
   if (sqlite3_prepare_v2(
-          db.get(),
-          ("SELECT value FROM " + table_name + " WHERE key = ?;").c_str(), -1,
-          &stmt, nullptr) != SQLITE_OK) {
+          db, ("SELECT value FROM " + table_name + " WHERE key = ?;").c_str(),
+          -1, &stmt, nullptr) != SQLITE_OK) {
     throw std::runtime_error("Can't prepare statement");
   }
   this->sqlite3_bind_key(stmt, 1, key);
@@ -190,9 +189,8 @@ template <class Key, class Value>
 Value db_as_map::unordered_map<Key, Value>::at(const Key& key) {
   sqlite3_stmt* stmt;
   if (sqlite3_prepare_v2(
-          db.get(),
-          ("SELECT value FROM " + table_name + " WHERE key = ?;").c_str(), -1,
-          &stmt, nullptr) != SQLITE_OK) {
+          db, ("SELECT value FROM " + table_name + " WHERE key = ?;").c_str(),
+          -1, &stmt, nullptr) != SQLITE_OK) {
     throw std::runtime_error("Can't prepare statement");
   }
   this->sqlite3_bind_key(stmt, 1, key);
@@ -241,7 +239,7 @@ void db_as_map::unordered_map<Key, Value>::replace(const Key& key,
   }
   sqlite3_stmt* stmt;
   if (sqlite3_prepare_v2(
-          db.get(),
+          db,
           ("UPDATE " + table_name + " SET value = ? WHERE key = ?;").c_str(),
           -1, &stmt, nullptr) != SQLITE_OK) {
     throw std::runtime_error("Can't prepare statement");
@@ -261,5 +259,29 @@ void db_as_map::unordered_map<Key, Value>::set(const Key& key,
     replace(key, value);
   } else {
     insert(key, value);
+  }
+}
+
+template <class Key, class Value>
+db_as_map::unordered_map<Key, Value>::~unordered_map() {
+  // clear the table
+  sqlite3_exec(db, ("DROP TABLE IF EXISTS " + table_name + ";").c_str(),
+               nullptr, nullptr, nullptr);
+
+  sqlite3_stmt* stmt;
+  const char* sql =
+      "SELECT COUNT(*) AS table_count FROM sqlite_master WHERE type='table';";
+  sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr);
+
+  size_t table_count = __SIZE_MAX__;
+  if (sqlite3_step(stmt) == SQLITE_ROW) {
+    table_count = sqlite3_column_int(stmt, 0);
+  }
+
+  sqlite3_finalize(stmt);
+
+  sqlite3_close(db);
+  if (table_count == 0 && db_name != ":memory:") {
+    std::remove(db_name.c_str());
   }
 }
